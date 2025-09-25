@@ -1,0 +1,404 @@
+/*
+  ESP32 4-Socket Energy Monitor with ZMPT101B Voltage Sensing
+  - AP SSID: "EcoCharge"
+  - AP PASS: "CPE CLASS 25"
+  - ZMPT101B library for voltage (RMS)
+  - ACS712 current sensors (one per socket)
+  - Web UI with AJAX (no page reload) + per-socket timers
+  - When a timer is set: only timer/manual OFF/overcurrent can switch OFF (full-charge cutoff disabled)
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ZMPT101B.h>
+
+// ----------------- AP Credentials -----------------
+const char *AP_SSID = "EcoCharge";
+const char *AP_PASS = "CPE CLASS 25"; // 8..63 ASCII; spaces ok
+
+// ----------------- ZMPT101B Voltage Sensor -----------------
+#define VOLTAGE_SENSOR_PIN 36
+#define LINE_FREQUENCY 50.0
+// Calibrate this to your mains and hardware (you provided 556.89f)
+#define VOLTAGE_SENSITIVITY 556.89f
+ZMPT101B voltageSensor(VOLTAGE_SENSOR_PIN, LINE_FREQUENCY);
+
+// ----------------- I2C LCDs (optional) -----------------
+const uint8_t LCD_ADDRESSES[] = {0x27, 0x23, 0x25, 0x26};
+LiquidCrystal_I2C lcds[4] = {
+  LiquidCrystal_I2C(LCD_ADDRESSES[0], 16, 2),
+  LiquidCrystal_I2C(LCD_ADDRESSES[1], 16, 2),
+  LiquidCrystal_I2C(LCD_ADDRESSES[2], 16, 2),
+  LiquidCrystal_I2C(LCD_ADDRESSES[3], 16, 2)
+};
+bool lcd_present[4] = {false, false, false, false};
+
+// ----------------- Pins -----------------
+const int ACS_PINS[4]   = {32, 39, 34, 35};   // ACS712 x4
+const int RELAY_PINS[4] = {33, 25, 26, 27};   // Relays x4
+const int LED_CHG[4]    = {21, 19, 18, 5};    // Charging LEDs (active HIGH)
+const int LED_CHRD[4]   = {16, 4, 2, 15};     // Charged/Idle LEDs (active HIGH)
+#define BUZZER_PIN 17
+#define I2C_SDA 23
+#define I2C_SCL 22
+
+// ----------------- Current Sensor Settings -----------------
+// ACS712 sensitivity (V/A): 5A->0.185, 20A->0.100, 30A->0.066
+const float ACS_SENSITIVITY = 0.185; // using 5A module by default
+float ACS_OFFSETS[4] = {0,0,0,0};    // measured (Vrms) at no-load for each channel
+
+// ----------------- Protection & thresholds -----------------
+const float MAX_CURRENT_A = 15.0;            // overcurrent cutoff
+const float FULL_CHG_THRESHOLD_A = 0.10;     // full-charge current threshold
+const unsigned long FULL_CHG_DELAY_MS = 5000; // must stay below threshold this long
+
+// ----------------- Timing Constants -----------------
+const unsigned long INTEGRATION_INTERVAL_MS = 1000;
+const unsigned long SENSOR_READ_INTERVAL_MS = 1000;
+
+// ----------------- Relay Configuration -----------------
+const bool RELAY_ACTIVE_LOW = true;
+
+// ----------------- System State -----------------
+WebServer server(80);
+
+float Vrms = 0.0;
+float Irms[4] = {0,0,0,0};
+float powerW[4] = {0,0,0,0};
+double energyWh[4] = {0,0,0,0};
+bool relayOn[4] = {false,false,false,false};
+
+unsigned long timerEndMs[4] = {0,0,0,0};     // per-socket timer deadline; 0 => no timer
+unsigned long belowThStart[4] = {0,0,0,0};   // for full-charge detection debounce
+unsigned long lastReadMs = 0;
+unsigned long lastIntegrateMs = 0;
+
+// ----------------- Utility Functions -----------------
+inline void setRelayState(int idx, bool on) {
+  relayOn[idx] = on;
+  digitalWrite(RELAY_PINS[idx], RELAY_ACTIVE_LOW ? (on ? LOW : HIGH) : (on ? HIGH : LOW));
+  // LEDs: charging LED on only when relay ON and current >= threshold; else charged LED
+  // (actual LED update also handled every loop below, but set a sane immediate state)
+  digitalWrite(LED_CHG[idx], on ? HIGH : LOW);
+  digitalWrite(LED_CHRD[idx], on ? LOW : HIGH);
+  if (!on) {
+    belowThStart[idx] = 0; // reset charge-detect debounce when turning off
+  }
+}
+
+void beep(int freq, int durMs) {
+  tone(BUZZER_PIN, freq, durMs);
+  delay(durMs + 10);
+  noTone(BUZZER_PIN);
+}
+
+// Simple RMS reader in mV at a given ADC pin
+float readRMS_analog_mv(int pin) {
+  const int N = 300;
+  const float ADC_REF_MV = 3300.0f;
+  // mean
+  double sumMv = 0;
+  for (int i=0;i<N;i++){
+    int adc = analogRead(pin);
+    sumMv += (adc / 4095.0) * ADC_REF_MV;
+    delayMicroseconds(180);
+  }
+  float meanMv = sumMv / N;
+  // rms of centered
+  double sumSq = 0;
+  for (int i=0;i<N;i++){
+    int adc = analogRead(pin);
+    float mv = (adc / 4095.0) * ADC_REF_MV;
+    float centered = mv - meanMv;
+    sumSq += centered * centered;
+    delayMicroseconds(180);
+  }
+  return sqrt(sumSq / N);
+}
+
+// Convert ACS712 reading (pin + index for offset) to Irms (A)
+float readIrms(int pin, int idx) {
+  float rmsMv = readRMS_analog_mv(pin);     // mV RMS from ADC
+  float voltsRms = (rmsMv / 1000.0f) - ACS_OFFSETS[idx]; // subtract per-channel offset (V)
+  return fabs(voltsRms / ACS_SENSITIVITY);
+}
+
+// Calibrate ACS offsets at startup (no load on sensors!)
+void calibrateCurrentSensors() {
+  for(int i=0; i<4; i++) {
+    ACS_OFFSETS[i] = readRMS_analog_mv(ACS_PINS[i]) / 1000.0f;
+    Serial.printf("ACS712-%d offset: %.4f V\n", i+1, ACS_OFFSETS[i]);
+  }
+}
+
+// ----------------- Web Server Handlers -----------------
+void handleDataJSON() {
+  // Build compact JSON
+  String j = "{";
+  j += "\"voltage\":" + String(Vrms,2) + ",";
+  j += "\"current\":[" + String(Irms[0],3)+","+String(Irms[1],3)+","+String(Irms[2],3)+","+String(Irms[3],3) + "],";
+  j += "\"power\":[" + String(powerW[0],2)+","+String(powerW[1],2)+","+String(powerW[2],2)+","+String(powerW[3],2) + "],";
+  j += "\"energy\":[" + String(energyWh[0],3)+","+String(energyWh[1],3)+","+String(energyWh[2],3)+","+String(energyWh[3],3) + "],";
+  j += "\"relay\":[" + String(relayOn[0])+","+String(relayOn[1])+","+String(relayOn[2])+","+String(relayOn[3]) + "],";
+  j += "\"remainMin\":[";
+  for (int i=0;i<4;i++){
+    float rm = 0;
+    if (timerEndMs[i] > millis()) rm = (timerEndMs[i] - millis()) / 60000.0f;
+    j += String(rm,2);
+    if (i<3) j += ",";
+  }
+  j += "]";
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
+void handleToggle() {
+  if (!server.hasArg("ch") || !server.hasArg("state")) { server.send(400,"text/plain","bad args"); return; }
+  int ch = constrain(server.arg("ch").toInt(), 0, 3);
+  bool st = server.arg("state").toInt() != 0;
+  setRelayState(ch, st);
+  if (!st) timerEndMs[ch] = 0; // manual OFF clears timer
+  server.send(200, "text/plain", "ok");
+}
+
+void handleTimer() {
+  if (!server.hasArg("ch") || !server.hasArg("minutes")) { server.send(400,"text/plain","bad args"); return; }
+  int ch = constrain(server.arg("ch").toInt(), 0, 3);
+  int minutes = constrain(server.arg("minutes").toInt(), 1, 1440);
+  timerEndMs[ch] = millis() + (unsigned long)minutes * 60000UL;
+  setRelayState(ch, true); // ensures ON while timer runs
+  server.send(200, "text/plain", "ok");
+}
+
+void handleResetEnergy() {
+  for (int i=0;i<4;i++) energyWh[i] = 0;
+  server.send(200, "text/plain", "ok");
+}
+
+void handleCalibrate() {
+  if (server.hasArg("vcal")) {
+    voltageSensor.setSensitivity(server.arg("vcal").toFloat());
+    server.send(200, "text/plain", "Voltage sensitivity updated");
+  } else if (server.hasArg("current")) {
+    calibrateCurrentSensors();
+    server.send(200, "text/plain", "Current sensors calibrated");
+  } else {
+    server.send(400, "text/plain", "Specify '?vcal=###' or '?current'");
+  }
+}
+
+void handleRoot() {
+  // Build HTML with dynamic MAX_CURRENT_A inlined in the JS compare
+  String s;
+  s += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  s += "<title>EcoCharge - Smart Office Automation System</title>";
+  s += "<style>";
+  s += "body{font-family:Helvetica,Arial;background:#0b1020;color:#eaf0ff;padding:12px}";
+  s += ".card{background:#111933;padding:12px;border-radius:10px;margin:8px 0}";
+  s += "button,input{padding:8px;border-radius:8px;border:0;background:#1b2647;color:#eaf0ff}";
+  s += ".row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}";
+  s += ".overload{color:#ff5555 !important;font-weight:bold}";
+  s += "</style></head><body>";
+  s += "<h2>EcoCharge — Smart Office Automation System</h2>";
+  s += "<div class='card'><b>Voltage:</b> <span id='voltage'>--</span> V</div>";
+
+  for (int i=0;i<4;i++){
+    s += "<div class='card'>";
+    s += "<h3>Socket " + String(i+1) + " &nbsp; <span id='state"+String(i)+"'>--</span></h3>";
+    s += "<div>Current: <span id='cur"+String(i)+"'>--</span> A</div>";
+    s += "<div>Power: <span id='pow"+String(i)+"'>--</span> W</div>";
+    s += "<div>Energy: <span id='eng"+String(i)+"'>--</span> Wh</div>";
+    s += "<div>Timer: <span id='tmr"+String(i)+"'>--</span></div>";
+    s += "<div class='row' style='margin-top:8px'>";
+    s += "<button onclick='toggle("+String(i)+",1)'>Turn ON</button>";
+    s += "<button onclick='toggle("+String(i)+",0)'>Turn OFF</button>";
+    s += "<input id='min"+String(i)+"' type='number' placeholder='minutes' style='width:90px'>";
+    s += "<button onclick='setTimer("+String(i)+")'>Set Timer</button>";
+    s += "</div></div>";
+  }
+
+  s += "<div class='card'><button onclick='resetEnergy()'>Reset energy counters</button> ";
+  s += "<button onclick='calibrate(\"current\")'>Calibrate Current Sensors</button></div>";
+
+  // JS (AJAX)
+  s += "<script>";
+  s += "const MAXA=" + String(MAX_CURRENT_A,2) + ";";
+  s += "function loadData(){";
+  s += " fetch('/data').then(r=>r.json()).then(d=>{";
+  s += "  document.getElementById('voltage').innerText=d.voltage.toFixed(2);";
+  s += "  for(let i=0;i<4;i++){";
+  s += "    const cur=d.current[i];";
+  s += "    document.getElementById('cur'+i).innerText=cur.toFixed(3);";
+  s += "    document.getElementById('pow'+i).innerText=d.power[i].toFixed(2);";
+  s += "    document.getElementById('eng'+i).innerText=d.energy[i].toFixed(3);";
+  s += "    document.getElementById('state'+i).innerText=d.relay[i]?'ON':'OFF';";
+  s += "    const rm=d.remainMin[i];";
+  s += "    document.getElementById('tmr'+i).innerText = (rm>0? rm.toFixed(1)+' min left':'—');";
+  s += "    const e=document.getElementById('cur'+i);";
+  s += "    if(cur>MAXA) e.classList.add('overload'); else e.classList.remove('overload');";
+  s += "  }";
+  s += " });";
+  s += "}";
+  s += "function toggle(ch,st){ fetch('/toggle?ch='+ch+'&state='+(st?1:0)).then(()=>setTimeout(loadData,200)); }";
+  s += "function setTimer(ch){ const v=document.getElementById('min'+ch).value; if(!v||v<=0)return; fetch('/timer?ch='+ch+'&minutes='+v).then(()=>setTimeout(loadData,200)); }";
+  s += "function resetEnergy(){ fetch('/reset-energy').then(()=>setTimeout(loadData,200)); }";
+  s += "function calibrate(type){ if(type==='current') { fetch('/calibrate?current').then(()=>setTimeout(loadData,200)); } }";
+  s += "setInterval(loadData,1000); window.onload=loadData;";
+  s += "</script>";
+
+  s += "</body></html>";
+  server.send(200, "text/html", s);
+}
+
+// ----------------- Setup -----------------
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  // ADC attenuation for wide input range
+  analogSetPinAttenuation(VOLTAGE_SENSOR_PIN, ADC_11db);
+  for (int i=0;i<4;i++) analogSetPinAttenuation(ACS_PINS[i], ADC_11db);
+
+  // Voltage sensor
+  voltageSensor.setSensitivity(VOLTAGE_SENSITIVITY);
+  // If your ZMPT library has begin(), uncomment:
+  // voltageSensor.begin();
+
+  // I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // LCDs (optional)
+  for(int i=0;i<4;i++) {
+    Wire.beginTransmission(LCD_ADDRESSES[i]);
+    if(Wire.endTransmission()==0) {
+      lcds[i].init();
+      lcds[i].backlight();
+      lcds[i].clear();
+      lcds[i].print("Socket "); lcds[i].print(i+1);
+      lcd_present[i] = true;
+    }
+  }
+
+  // GPIOs
+  for(int i=0;i<4;i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    setRelayState(i, false);
+    pinMode(LED_CHG[i], OUTPUT); digitalWrite(LED_CHG[i], LOW);
+    pinMode(LED_CHRD[i], OUTPUT); digitalWrite(LED_CHRD[i], HIGH);
+  }
+  pinMode(BUZZER_PIN, OUTPUT); noTone(BUZZER_PIN);
+
+  // Calibrate ACS (ensure no load connected)
+  calibrateCurrentSensors();
+
+  // Wi-Fi AP
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  // Web routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/data", HTTP_GET, handleDataJSON);
+  server.on("/toggle", HTTP_GET, handleToggle);
+  server.on("/timer", HTTP_GET, handleTimer);
+  server.on("/reset-energy", HTTP_GET, handleResetEnergy);
+  server.on("/calibrate", HTTP_GET, handleCalibrate);
+  server.begin();
+
+  lastReadMs = millis();
+  lastIntegrateMs = millis();
+
+  Serial.println("System ready");
+}
+
+// ----------------- Loop -----------------
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+
+  // Periodic sensor read
+  if(now - lastReadMs >= SENSOR_READ_INTERVAL_MS) {
+    lastReadMs = now;
+
+    // Voltage
+    Vrms = voltageSensor.getRmsVoltage();
+
+    // Currents & power
+    for(int i=0;i<4;i++) {
+      Irms[i] = readIrms(ACS_PINS[i], i);
+      powerW[i] = Vrms * Irms[i];
+
+      // Overcurrent protection (always active)
+      if(Irms[i] > MAX_CURRENT_A && relayOn[i]) {
+        setRelayState(i, false);
+        timerEndMs[i] = 0;
+        digitalWrite(LED_CHG[i], LOW);
+        digitalWrite(LED_CHRD[i], HIGH);
+        beep(3000, 600);
+      }
+    }
+
+    // LCD updates (if present)
+    for(int i=0; i<4; i++) if(lcd_present[i]) {
+      lcds[i].setCursor(0,0);
+      lcds[i].print("V:"); lcds[i].print(Vrms,1); lcds[i].print("V   ");
+      lcds[i].setCursor(0,1);
+      lcds[i].print("I:"); lcds[i].print(Irms[i],3); lcds[i].print("A   ");
+    }
+
+    // Debug
+    Serial.printf("V=%.2fV | I=%.3f, %.3f, %.3f, %.3f A\n", Vrms, Irms[0], Irms[1], Irms[2], Irms[3]);
+  }
+
+  // Energy integration
+  if(now - lastIntegrateMs >= INTEGRATION_INTERVAL_MS) {
+    lastIntegrateMs += INTEGRATION_INTERVAL_MS;
+    const float hours = INTEGRATION_INTERVAL_MS / 3600000.0f;
+    for(int i=0;i<4;i++) {
+      if(relayOn[i]) energyWh[i] += powerW[i] * hours;
+    }
+  }
+
+  // Timers + charge detection + LED logic
+  for(int i=0;i<4;i++) {
+    // Timer expiration (always active)
+    if(timerEndMs[i] != 0 && now >= timerEndMs[i]) {
+      timerEndMs[i] = 0;
+      setRelayState(i, false);
+      digitalWrite(LED_CHRD[i], HIGH);
+      digitalWrite(LED_CHG[i], LOW);
+      beep(1800, 300);
+    }
+
+    // Full-charge detection ONLY when no timer is running
+    if (relayOn[i] && timerEndMs[i] == 0) {
+      if (Irms[i] < FULL_CHG_THRESHOLD_A) {
+        if (belowThStart[i] == 0) belowThStart[i] = now;
+        else if (now - belowThStart[i] >= FULL_CHG_DELAY_MS) {
+          setRelayState(i, false);
+          digitalWrite(LED_CHRD[i], HIGH);
+          digitalWrite(LED_CHG[i], LOW);
+          beep(2000, 400);
+        }
+      } else {
+        belowThStart[i] = 0;
+      }
+    }
+
+    // LED status: charging vs charged/off
+    if (relayOn[i] && Irms[i] >= FULL_CHG_THRESHOLD_A) {
+      digitalWrite(LED_CHG[i], HIGH);
+      digitalWrite(LED_CHRD[i], LOW);
+    } else if (!relayOn[i]) {
+      digitalWrite(LED_CHG[i], LOW);
+      digitalWrite(LED_CHRD[i], HIGH);
+    } else {
+      // relay on but low current (< threshold) — likely trickle/idle
+      digitalWrite(LED_CHG[i], LOW);
+      digitalWrite(LED_CHRD[i], HIGH);
+    }
+  }
+}
